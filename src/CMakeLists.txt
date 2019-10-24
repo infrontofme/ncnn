@@ -25,6 +25,7 @@ set(ncnn_SRCS
     paramdict.cpp
     pipeline.cpp
     benchmark.cpp
+    object_detection.cpp
 )
 
 if (ANDROID)
@@ -267,6 +268,10 @@ ncnn_add_layer(HardSigmoid)
 ncnn_add_layer(SELU)
 ncnn_add_layer(HardSwish)
 ncnn_add_layer(Noop)
+ncnn_add_layer(DarknetActivation)
+ncnn_add_layer(DarknetShortcut)
+ncnn_add_layer(Yolov1Detection)
+ncnn_add_layer(Yolov3Detection)
 
 add_custom_target(generate-spirv DEPENDS ${SHADER_SPV_HEX_FILES})
 
