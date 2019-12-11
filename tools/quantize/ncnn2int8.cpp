@@ -24,6 +24,10 @@
 #include <limits>
 #include <map>
 #include <algorithm>
+#include <layer/yolov3detection.h>
+#include <layer/yolov1detection.h>
+#include <layer/darknetshortcut.h>
+#include <layer/darknetactivation.h>
 
 // ncnn public header
 #include "net.h"
@@ -1126,6 +1130,43 @@ int NetQuantize::save(const char* parampath, const char* binpath)
             { if (!op->biases.empty()) fprintf_param_float_array(4, op->biases, pp); }
             { if (!op->mask.empty()) fprintf_param_int_array(5, op->mask, pp); }
             { if (!op->anchors_scale.empty()) fprintf_param_float_array(6, op->anchors_scale, pp); }
+        }else if(layer->type == "DarknetActivation")
+        {
+            ncnn::DarknetActivation *op = (ncnn::DarknetActivation*) layer;
+            ncnn::DarknetActivation *op_default = (ncnn::DarknetActivation*) layer_default;
+
+            fprintf_param_value(" 0=%d", activate_type);
+        }else if(layer->type == "DarknetShortcut")
+        {
+            ncnn::DarknetShortcut * op = (ncnn::DarknetShortcut*) layer;
+            ncnn::DarknetShortcut * op_default = (ncnn::DarknetShortcut*) layer_default;
+
+            fprintf_param_value(" 0=%f", alpha);
+            fprintf_param_value(" 1=%f", beta);
+        }else if(layer->type == "Yolov1Detection"){
+            ncnn::Yolov1Detection *op = (ncnn::Yolov1Detection*) layer;
+            ncnn::Yolov1Detection *op_default = (ncnn::Yolov1Detection*) layer_default;
+
+            fprintf_param_value(" 0=%d", side);
+            fprintf_param_value(" 1=%d", classes);
+            fprintf_param_value(" 2=%d", box_num);
+            fprintf_param_value(" 3=%d", sqrt_enable);
+            fprintf_param_value(" 4=%d", softmax_enable);
+            fprintf_param_value(" 5=%f", confidence_threshold);
+            fprintf_param_value(" 6=%f", nms_threshold);
+        }else if(layer->type == "Yolov3Detection"){
+            ncnn::Yolov3Detection *op = (ncnn::Yolov3Detection*) layer;
+            ncnn::Yolov3Detection *op_default = (ncnn::Yolov3Detection*) layer_default;
+
+            fprintf_param_value(" 0=%d", classes);
+            fprintf_param_value(" 1=%d", box_num);
+            fprintf_param_value(" 2=%d", softmax_enable);
+            fprintf_param_value(" 3=%f", confidence_threshold);
+            fprintf_param_value(" 4=%f", nms_threshold);
+            fprintf_param_value(" 5=%d", net_width);
+            fprintf_param_value(" 6=%d", net_height);
+
+            { if (!op->biases.empty()) fprintf_param_float_array(7, op->biases, pp); }
         }
 
 #undef fprintf_param_value

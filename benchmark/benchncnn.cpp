@@ -215,10 +215,10 @@ int main(int argc, char** argv)
     fprintf(stderr, "gpu_device = %d\n", gpu_device);
 
     // run
-    benchmark("yolov1-tiny", ncnn::Mat(448, 448, 3));
-    benchmark("yolov2-tiny", ncnn::Mat(416, 416, 3));
+    benchmark("yolov1-tiny", ncnn::Mat(448, 448, 3), opt);
+    benchmark("yolov2-tiny", ncnn::Mat(416, 416, 3), opt);
 
-    benchmark("squeezenet", ncnn::Mat(227, 227, 3));
+    benchmark("squeezenet", ncnn::Mat(227, 227, 3), opt);
 
 #if NCNN_VULKAN
     if (!use_vulkan_compute)
