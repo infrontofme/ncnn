@@ -17,6 +17,7 @@
 #include <vector>
 
 // ncnn public header
+#include "datareader.h"
 #include "net.h"
 #include "layer.h"
 
@@ -89,57 +90,15 @@
 
 #endif // defined(__aarch64__) && defined(LINUX)
 
-// always return empty weights
-class ModelBinFromEmpty : public ncnn::ModelBin
+class DataReaderFromEmpty : public ncnn::DataReader
 {
 public:
-    virtual ncnn::Mat load(int w, int /*type*/) const { return ncnn::Mat(w); }
+    virtual int scan(const char* format, void* p) const { return 0; }
+    virtual int read(void* /*buf*/, int size) const { return size; }
 };
 
 class NetOptimize : public ncnn::Net
 {
-public:
-    int load_model()
-    {
-        // load file
-        int ret = 0;
-
-        ModelBinFromEmpty mb;
-        for (size_t i=0; i<layers.size(); i++)
-        {
-            ncnn::Layer* layer = layers[i];
-
-            int lret = layer->load_model(mb);
-            if (lret != 0)
-            {
-                fprintf(stderr, "layer load_model %d failed\n", (int)i);
-                ret = -1;
-                break;
-            }
-
-            int cret = layer->create_pipeline(opt);
-            if (cret != 0)
-            {
-                fprintf(stderr, "layer create_pipeline %d failed\n", (int)i);
-                ret = -1;
-                break;
-            }
-        }
-
-#if NCNN_VULKAN
-        if (opt.use_vulkan_compute)
-        {
-            upload_model();
-
-            create_pipeline();
-        }
-#endif // NCNN_VULKAN
-
-        fuse_network();
-
-        return ret;
-    }
-
 public:
     // 0=fp32 1=fp16
     int storage_type;
@@ -159,7 +118,9 @@ public:
     int fuse_innerproduct_activation();
 
     int eliminate_dropout();
+    int eliminate_pooling1x1();
     int eliminate_noop();
+    int eliminate_orphaned_memorydata();
     int eliminate_flatten_after_global_pooling();
     int eliminate_reshape_after_global_pooling();
     int eliminate_flatten_after_innerproduct();
@@ -486,7 +447,7 @@ int NetOptimize::fuse_convolution_batchnorm()
                     conv_weight_outch[j] *= b[i];
                 }
 
-                bias[i] += a[i];
+                bias[i] = bias[i] * b[i] + a[i];
             }
         }
 
@@ -569,7 +530,7 @@ int NetOptimize::fuse_convolutiondepthwise_batchnorm()
                     conv_weight_outch[j] *= b[i];
                 }
 
-                bias[i] += a[i];
+                bias[i] = bias[i] * b[i] + a[i];
             }
         }
 
@@ -652,7 +613,7 @@ int NetOptimize::fuse_deconvolution_batchnorm()
                     conv_weight_outch[j] *= b[i];
                 }
 
-                bias[i] += a[i];
+                bias[i] = bias[i] * b[i] + a[i];
             }
         }
 
@@ -735,7 +696,7 @@ int NetOptimize::fuse_deconvolutiondepthwise_batchnorm()
                     conv_weight_outch[j] *= b[i];
                 }
 
-                bias[i] += a[i];
+                bias[i] = bias[i] * b[i] + a[i];
             }
         }
 
@@ -818,7 +779,7 @@ int NetOptimize::fuse_innerproduct_batchnorm()
                     conv_weight_outch[j] *= b[i];
                 }
 
-                bias[i] += a[i];
+                bias[i] = bias[i] * b[i] + a[i];
             }
         }
 
@@ -1298,6 +1259,63 @@ int NetOptimize::eliminate_dropout()
     return 0;
 }
 
+int NetOptimize::eliminate_pooling1x1()
+{
+    const int layer_count = layers.size();
+    for (int i=0; i<layer_count; i++)
+    {
+        if (layers[i]->type != "Pooling")
+            continue;
+
+        ncnn::Pooling* pooling = (ncnn::Pooling*)layers[i];
+        if (pooling->pad_left != 0 || pooling->pad_right != 0 || pooling->pad_top != 0 || pooling->pad_bottom != 0)
+            continue;
+
+        if (pooling->kernel_w != 1 || pooling->kernel_h != 1 || pooling->stride_w != 1 || pooling->stride_h != 1)
+            continue;
+
+        if (pooling->global_pooling != 0)
+            continue;
+
+        // Any - Pooling
+        int bottom_blob_index = layers[i]->bottoms[0];
+
+        int top_i = -1;
+        int j = i - 1;
+        for (; j>=0; j--)
+        {
+            if (layers[j]->type == "ncnnfused")
+                continue;
+
+            for (int k=0; k<layers[j]->tops.size(); k++)
+            {
+                if (layers[j]->tops[k] == bottom_blob_index)
+                {
+                    top_i = k;
+                    break;
+                }
+            }
+
+            if (top_i != -1)
+                break;
+        }
+
+        if (j == -1)
+            continue;
+
+        ncnn::Layer* any = layers[j];
+
+        fprintf(stderr, "eliminate_pooling1x1 %s %s\n", any->name.c_str(), pooling->name.c_str());
+
+        int top_blob_index_final = pooling->tops[0];
+        any->tops[top_i] = top_blob_index_final;
+        blobs[top_blob_index_final].producer = j;
+        pooling->type = "ncnnfused";
+    }
+
+    return 0;
+}
+
 int NetOptimize::eliminate_noop()
 {
     const int layer_count = layers.size();
@@ -1307,6 +1325,22 @@ int NetOptimize::eliminate_noop()
             continue;
 
         ncnn::Layer* noop = layers[i];
+
+        if (noop->bottoms.empty())
+        {
+            // Noop
+            fprintf(stderr, "eliminate_noop %s\n", noop->name.c_str());
+
+            int top_blob_count = noop->tops.size();
+            for (int k=0; k<top_blob_count; k++)
+            {
+                int top_blob_index_final = noop->tops[k];
+                blobs[top_blob_index_final].producer = -1;
+            }
+            noop->type = "ncnnfused";
+
+            continue;
+        }
 
         // Any - Noop
         int bottom_blob_index = layers[i]->bottoms[0];
@@ -1331,10 +1365,57 @@ int NetOptimize::eliminate_noop()
 
         fprintf(stderr, "eliminate_noop %s %s\n", any->name.c_str(), noop->name.c_str());
 
-        int top_blob_index_final = noop->tops[0];
-        any->tops[0] = top_blob_index_final;
-        blobs[top_blob_index_final].producer = j;
+        int top_blob_count = std::min(noop->tops.size(), any->tops.size());
+        for (int k=0; k<top_blob_count; k++)
+        {
+            int top_blob_index_final = noop->tops[k];
+            any->tops[k] = top_blob_index_final;
+            blobs[top_blob_index_final].producer = j;
+        }
         noop->type = "ncnnfused";
+    }
+
+    return 0;
+}
+
+int NetOptimize::eliminate_orphaned_memorydata()
+{
+    const int layer_count = layers.size();
+    for (int i=0; i<layer_count; i++)
+    {
+        if (layers[i]->type != "MemoryData")
+            continue;
+
+        // MemoryData - X
+        int top_blob_index = layers[i]->tops[0];
+
+        int j = i + 1;
+        for (; j<layer_count; j++)
+        {
+            if (layers[j]->type == "ncnnfused")
+                continue;
+
+            bool orphaned = true;
+            for (int k=0; k<layers[j]->bottoms.size(); k++)
+            {
+                if (layers[j]->bottoms[k] == top_blob_index)
+                {
+                    orphaned = false;
+                    break;
+                }
+            }
+
+            if (!orphaned)
+                break;
+        }
+
+        if (j < layer_count)
+            continue;
+
+        // assert orphaned == true
+        fprintf(stderr, "eliminate_orphaned_memorydata %s\n", layers[i]->name.c_str());
+
+        layers[i]->type = "ncnnfused";
     }
 
     return 0;
@@ -2137,6 +2218,7 @@ int NetOptimize::save(const char* parampath, const char* binpath)
             fprintf_param_value(" 2=%e", eps)
             fprintf_param_value(" 3=%d", scale_data_size)
             fprintf_param_value(" 4=%d", across_channel)
+            fprintf_param_value(" 9=%d", eps_mode)
 
             fwrite_weight_data(op->scale_data, bp);
         }
@@ -2251,6 +2333,8 @@ int NetOptimize::save(const char* parampath, const char* binpath)
             fprintf_param_value(" 0=%d", operation)
             fprintf_param_value(" 1=%d", reduce_all)
             fprintf_param_value(" 2=%e", coeff)
+            { if (!op->axes.empty()) fprintf_param_int_array(3, op->axes, pp); }
+            fprintf_param_value(" 4=%d", keepdims)
         }
         else if (layer->type == "ReLU")
         {
@@ -2446,9 +2530,12 @@ int main(int argc, char** argv)
 
     optimizer.load_param(inparam);
     if (strcmp(inbin, "null") == 0)
-        optimizer.load_model();
+    {
+        DataReaderFromEmpty dr;
+        optimizer.load_model(dr);
+    }
     else
-        optimizer.ncnn::Net::load_model(inbin);
+        optimizer.load_model(inbin);
 
 #if defined(__aarch64__) && defined(LINUX)
     optimizer.find_fastest_fp32_conv(dataname, inw, inh, inc);
@@ -2467,6 +2554,7 @@ int main(int argc, char** argv)
     optimizer.fuse_innerproduct_activation();
 
     optimizer.eliminate_dropout();
+    optimizer.eliminate_pooling1x1();
     optimizer.eliminate_noop();
     optimizer.eliminate_flatten_after_global_pooling();
     optimizer.eliminate_reshape_after_global_pooling();
@@ -2476,6 +2564,7 @@ int main(int argc, char** argv)
     optimizer.replace_convolution_with_innerproduct_after_innerproduct();
 
     optimizer.eliminate_flatten_after_innerproduct();
+    optimizer.eliminate_orphaned_memorydata();
 
     optimizer.save(outparam, outbin);
 

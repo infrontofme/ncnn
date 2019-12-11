@@ -19,8 +19,8 @@
 #if __ARM_NEON
 #include <arm_neon.h>
 #include "neon_mathfun.h"
-#include "neon_activation.h"
 #endif // __ARM_NEON
+#include "neon_activation.h"
 
 namespace ncnn {
 
@@ -30,6 +30,7 @@ InnerProduct_arm::InnerProduct_arm()
 {
 #if __ARM_NEON
     support_packing = true;
+    use_fp32_packing_inference = false;
 #endif // __ARM_NEON
 
     flatten = 0;
@@ -38,7 +39,16 @@ InnerProduct_arm::InnerProduct_arm()
 int InnerProduct_arm::create_pipeline(const Option& opt)
 {
 #if __ARM_NEON
-    if (opt.use_packing_layout)
+    bool weight_data_is_float32 = (weight_data.elemsize == (size_t)4u);
+
+    use_fp32_packing_inference = opt.use_packing_layout && weight_data_is_float32 && !use_int8_inference;
+
+    if (use_int8_inference)
+    {
+        support_packing = false;
+    }
+
+    if (use_fp32_packing_inference)
     {
 
     {
@@ -85,7 +95,7 @@ int InnerProduct_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Optio
     int size = w * h;
 
 #if __ARM_NEON
-    if (opt.use_packing_layout)
+    if (use_fp32_packing_inference)
     {
 
     if (elempack == 4)
@@ -95,7 +105,7 @@ int InnerProduct_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Optio
     Mat bottom_blob_flattened = bottom_blob;
     if (bottom_blob.dims != 1)
     {
-        ncnn::Option opt_flatten = opt;
+        Option opt_flatten = opt;
         opt_flatten.blob_allocator = opt.workspace_allocator;
 
         flatten->forward(bottom_blob, bottom_blob_flattened, opt_flatten);
