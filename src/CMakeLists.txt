@@ -8,6 +8,17 @@ if(NCNN_VULKAN)
     message(STATUS "Found glslangValidator: ${GLSLANGVALIDATOR_EXECUTABLE}")
 endif()
 
+# Add source file to list, and add to special visual folder
+function(ncnn_src_group ncnn_src_string folder)
+    string(REPLACE " " ";" _ncnn_src_list ${ncnn_src_string})
+
+    string(REGEX REPLACE "/" "\\\\" _target_folder "${folder}")
+
+    foreach(_file IN LISTS ${_ncnn_src_list}) 
+        source_group ("${_target_folder}" FILES "${_file}")
+    endforeach ()
+endfunction()
+
 set(ncnn_SRCS
     allocator.cpp
     blob.cpp
@@ -30,11 +41,13 @@ set(ncnn_SRCS
     object_detection.cpp
 )
 
+ncnn_src_group(ncnn_SRCS "sources")
+
 if(ANDROID)
     list(APPEND ncnn_SRCS mat_pixel_android.cpp)
 endif()
 
-include(${CMAKE_SOURCE_DIR}/cmake/ncnn_generate_shader_spv_header.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/ncnn_generate_shader_spv_header.cmake)
 
 macro(ncnn_add_shader SHADER_SRC)
     ncnn_generate_shader_spv_header(SHADER_SPV_HEADER SHADER_SPV_HEX_HEADERS ${SHADER_SRC})
@@ -43,13 +56,26 @@ macro(ncnn_add_shader SHADER_SRC)
     string(APPEND layer_shader_spv_data "#include \"${SHADER_SPV_HEADER_NAME}\"\n")
 
     get_filename_component(SHADER_SRC_NAME_WE ${SHADER_SRC} NAME_WE)
-    string(APPEND layer_shader_registry "{\"${SHADER_SRC_NAME_WE}\",${SHADER_SRC_NAME_WE}_spv_data,sizeof(${SHADER_SRC_NAME_WE}_spv_data)},\n")
-    string(APPEND layer_shader_registry "{\"${SHADER_SRC_NAME_WE}_fp16p\",${SHADER_SRC_NAME_WE}_fp16p_spv_data,sizeof(${SHADER_SRC_NAME_WE}_fp16p_spv_data)},\n")
-    string(APPEND layer_shader_registry "{\"${SHADER_SRC_NAME_WE}_fp16s\",${SHADER_SRC_NAME_WE}_fp16s_spv_data,sizeof(${SHADER_SRC_NAME_WE}_fp16s_spv_data)},\n")
-    string(APPEND layer_shader_registry "{\"${SHADER_SRC_NAME_WE}_fp16a\",${SHADER_SRC_NAME_WE}_fp16a_spv_data,sizeof(${SHADER_SRC_NAME_WE}_fp16a_spv_data)},\n")
+    string(APPEND layer_shader_registry "{${SHADER_SRC_NAME_WE}_spv_data,sizeof(${SHADER_SRC_NAME_WE}_spv_data)},\n")
+    string(APPEND layer_shader_registry "{${SHADER_SRC_NAME_WE}_fp16p_spv_data,sizeof(${SHADER_SRC_NAME_WE}_fp16p_spv_data)},\n")
+    string(APPEND layer_shader_registry "{${SHADER_SRC_NAME_WE}_fp16pa_spv_data,sizeof(${SHADER_SRC_NAME_WE}_fp16pa_spv_data)},\n")
+    string(APPEND layer_shader_registry "{${SHADER_SRC_NAME_WE}_fp16s_spv_data,sizeof(${SHADER_SRC_NAME_WE}_fp16s_spv_data)},\n")
+    string(APPEND layer_shader_registry "{${SHADER_SRC_NAME_WE}_fp16sa_spv_data,sizeof(${SHADER_SRC_NAME_WE}_fp16sa_spv_data)},\n")
 
     list(APPEND SHADER_SPV_HEX_FILES ${SHADER_SPV_HEADER})
     list(APPEND SHADER_SPV_HEX_FILES ${SHADER_SPV_HEX_HEADERS})
+
+    # generate layer_shader_type_enum file
+    set(layer_shader_type_enum "${layer_shader_type_enum}${SHADER_SRC_NAME_WE} = ${__LAYER_SHADER_TYPE_ENUM_INDEX},\n")
+    math(EXPR __LAYER_SHADER_TYPE_ENUM_INDEX "${__LAYER_SHADER_TYPE_ENUM_INDEX}+1")
+    set(layer_shader_type_enum "${layer_shader_type_enum}${SHADER_SRC_NAME_WE}_fp16p = ${__LAYER_SHADER_TYPE_ENUM_INDEX},\n")
+    math(EXPR __LAYER_SHADER_TYPE_ENUM_INDEX "${__LAYER_SHADER_TYPE_ENUM_INDEX}+1")
+    set(layer_shader_type_enum "${layer_shader_type_enum}${SHADER_SRC_NAME_WE}_fp16pa = ${__LAYER_SHADER_TYPE_ENUM_INDEX},\n")
+    math(EXPR __LAYER_SHADER_TYPE_ENUM_INDEX "${__LAYER_SHADER_TYPE_ENUM_INDEX}+1")
+    set(layer_shader_type_enum "${layer_shader_type_enum}${SHADER_SRC_NAME_WE}_fp16s = ${__LAYER_SHADER_TYPE_ENUM_INDEX},\n")
+    math(EXPR __LAYER_SHADER_TYPE_ENUM_INDEX "${__LAYER_SHADER_TYPE_ENUM_INDEX}+1")
+    set(layer_shader_type_enum "${layer_shader_type_enum}${SHADER_SRC_NAME_WE}_fp16sa = ${__LAYER_SHADER_TYPE_ENUM_INDEX},\n")
+    math(EXPR __LAYER_SHADER_TYPE_ENUM_INDEX "${__LAYER_SHADER_TYPE_ENUM_INDEX}+1")
 endmacro()
 
 macro(ncnn_add_layer class)
@@ -74,6 +100,8 @@ macro(ncnn_add_layer class)
         if((IOS AND CMAKE_OSX_ARCHITECTURES MATCHES "arm")
             OR (CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm|aarch64)"))
             set(arch arm)
+        elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(mips)")
+            set(arch mips)
         else()
             set(arch x86)
         endif()
@@ -97,6 +125,8 @@ macro(ncnn_add_layer class)
         set(layer_declaration_class "class ${class}_final : virtual public ${class}")
         set(create_pipeline_content "        { int ret = ${class}::create_pipeline(opt); if (ret) return ret; }\n")
         set(destroy_pipeline_content "        { int ret = ${class}::destroy_pipeline(opt); if (ret) return ret; }\n")
+
+        source_group ("sources\\\\layers" FILES "${CMAKE_CURRENT_SOURCE_DIR}/layer/${name}.cpp")
     endif()
 
     if(WITH_LAYER_${name}_${arch})
@@ -104,6 +134,8 @@ macro(ncnn_add_layer class)
         set(layer_declaration_class "${layer_declaration_class}, virtual public ${class}_${arch}")
         set(create_pipeline_content "${create_pipeline_content}        { int ret = ${class}_${arch}::create_pipeline(opt); if (ret) return ret; }\n")
         set(destroy_pipeline_content "        { int ret = ${class}_${arch}::destroy_pipeline(opt); if (ret) return ret; }\n${destroy_pipeline_content}")
+
+        source_group ("sources\\\\layers\\\\${arch}" FILES "${CMAKE_CURRENT_SOURCE_DIR}/layer/${arch}/${name}_${arch}.cpp")
     endif()
 
     if(WITH_LAYER_${name}_vulkan)
@@ -118,6 +150,8 @@ macro(ncnn_add_layer class)
         foreach(SHADER_SRC ${SHADER_SRCS})
             ncnn_add_shader(${SHADER_SRC})
         endforeach()
+
+        source_group ("sources\\\\layers\\\\vulkan" FILES "${CMAKE_CURRENT_SOURCE_DIR}/layer/vulkan/${name}_vulkan.cpp")
     endif()
 
     if(WITH_LAYER_${name})
@@ -136,7 +170,7 @@ macro(ncnn_add_layer class)
     endif()
 
     # generate layer_type_enum file
-    string(APPEND layer_type_enum "${class} = ${__LAYER_TYPE_ENUM_INDEX},\n")
+    set(layer_type_enum "${layer_type_enum}${class} = ${__LAYER_TYPE_ENUM_INDEX},\n")
     math(EXPR __LAYER_TYPE_ENUM_INDEX "${__LAYER_TYPE_ENUM_INDEX}+1")
 endmacro()
 
@@ -144,6 +178,7 @@ endmacro()
 set(SHADER_SPV_HEX_FILES)
 
 set(__LAYER_TYPE_ENUM_INDEX 0)
+set(__LAYER_SHADER_TYPE_ENUM_INDEX 0)
 
 # layer implementation
 ncnn_add_layer(AbsVal)
@@ -185,7 +220,7 @@ ncnn_add_layer(TanH)
 ncnn_add_layer(Threshold)
 ncnn_add_layer(Tile OFF)
 ncnn_add_layer(RNN OFF)
-ncnn_add_layer(LSTM OFF)
+ncnn_add_layer(LSTM)
 ncnn_add_layer(BinaryOp)
 ncnn_add_layer(UnaryOp)
 ncnn_add_layer(ConvolutionDepthWise)
@@ -215,6 +250,8 @@ ncnn_add_layer(HardSigmoid)
 ncnn_add_layer(SELU)
 ncnn_add_layer(HardSwish)
 ncnn_add_layer(Noop)
+ncnn_add_layer(PixelShuffle)
+ncnn_add_layer(DeepCopy)
 ncnn_add_layer(DarknetActivation)
 ncnn_add_layer(DarknetShortcut)
 ncnn_add_layer(Yolov1Detection)
@@ -232,6 +269,7 @@ configure_file(layer_registry.h.in ${CMAKE_CURRENT_BINARY_DIR}/layer_registry.h)
 configure_file(layer_type_enum.h.in ${CMAKE_CURRENT_BINARY_DIR}/layer_type_enum.h)
 configure_file(layer_shader_registry.h.in ${CMAKE_CURRENT_BINARY_DIR}/layer_shader_registry.h)
 configure_file(layer_shader_spv_data.h.in ${CMAKE_CURRENT_BINARY_DIR}/layer_shader_spv_data.h)
+configure_file(layer_shader_type_enum.h.in ${CMAKE_CURRENT_BINARY_DIR}/layer_shader_type_enum.h)
 
 add_library(ncnn STATIC ${ncnn_SRCS})
 
@@ -316,17 +354,21 @@ elseif(NCNN_AVX2)
         target_compile_options(ncnn PRIVATE /arch:AVX2 /DAVX2)
     #Linux
     else()
-        target_compile_options(ncnn PRIVATE -mfma)
+        target_compile_options(ncnn PRIVATE -mfma -mf16c)
     endif()
 endif()
 
 add_dependencies(ncnn generate-spirv)
 
-if(NCNN_OPENMP AND OpenMP_CXX_FOUND)
+if(NCNN_OPENMP AND (OpenMP_CXX_FOUND OR OPENMP_FOUND))
     if(NCNN_CMAKE_VERBOSE)
         message("Building with OpenMP")
     endif()
-    target_link_libraries(ncnn PUBLIC OpenMP::OpenMP_CXX)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(ncnn PUBLIC OpenMP::OpenMP_CXX)
+    else()
+        target_link_libraries(ncnn PRIVATE "${OpenMP_CXX_FLAGS}")
+    endif()
 endif()
 
 if(NCNN_INSTALL_SDK)
@@ -339,6 +381,7 @@ if(NCNN_INSTALL_SDK)
         datareader.h
         gpu.h
         layer.h
+        layer_shader_type.h
         layer_type.h
         mat.h
         modelbin.h
@@ -348,6 +391,7 @@ if(NCNN_INSTALL_SDK)
         paramdict.h
         pipeline.h
         benchmark.h
+        ${CMAKE_CURRENT_BINARY_DIR}/layer_shader_type_enum.h
         ${CMAKE_CURRENT_BINARY_DIR}/layer_type_enum.h
         ${CMAKE_CURRENT_BINARY_DIR}/platform.h
         DESTINATION include/ncnn
@@ -361,3 +405,8 @@ if(NCNN_INSTALL_SDK)
         ${CMAKE_CURRENT_BINARY_DIR}/ncnnConfig.cmake
         DESTINATION lib/cmake/ncnn)
 endif()
+
+# add ncnn and generate-spirv to a virtual project group
+set_property(GLOBAL PROPERTY USE_FOLDERS ON)
+set_property(TARGET ncnn PROPERTY FOLDER "libncnn")
+set_property(TARGET generate-spirv PROPERTY FOLDER "libncnn")

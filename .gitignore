@@ -1,5 +1,5 @@
 # CMake build directory
-*build*/
+build*/
 
 # Backup files.
 *~
@@ -43,3 +43,11 @@
 # IDE
 .vs
 .vscode
+
+\.idea/
+
+benchmark/benchncnn
+
+cmake-build-debug/
+
+cmake-build-debug-system/

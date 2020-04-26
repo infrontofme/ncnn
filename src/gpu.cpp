@@ -49,6 +49,24 @@ static GpuInfo g_gpu_infos[NCNN_MAX_GPU_COUNT];
 static Mutex g_default_vkdev_lock;
 static VulkanDevice* g_default_vkdev[NCNN_MAX_GPU_COUNT] = {0};
 
+// precompiled spirv
+struct layer_shader_registry_entry
+{
+    const uint32_t* spv_data;
+    size_t spv_data_size;
+};
+
+#include "layer_shader_spv_data.h"
+
+static const layer_shader_registry_entry layer_shader_registry[] =
+{
+#include "layer_shader_registry.h"
+};
+
+static ShaderInfo layer_shader_infos[sizeof(layer_shader_registry) / sizeof(layer_shader_registry_entry)];
+
+static const int layer_shader_registry_entry_count = sizeof(layer_shader_registry) / sizeof(layer_shader_registry_entry);
+
 int support_VK_KHR_external_memory_capabilities = 0;
 int support_VK_KHR_get_physical_device_properties2 = 0;
 int support_VK_KHR_get_surface_capabilities2 = 0;
@@ -439,7 +457,7 @@ int create_gpu_instance()
     applicationInfo.pApplicationName = "ncnn";
     applicationInfo.applicationVersion = 0;
     applicationInfo.pEngineName = "ncnn";
-    applicationInfo.engineVersion = 20190319;
+    applicationInfo.engineVersion = 20200413;
     applicationInfo.apiVersion = VK_MAKE_VERSION(1, 0, 0);
 
     VkInstanceCreateInfo instanceCreateInfo;
@@ -520,18 +538,33 @@ int create_gpu_instance()
 //         fprintf(stderr, "[%u] deviceName = %s\n", i, physicalDeviceProperties.deviceName);
 //         fprintf(stderr, "[%u] pipelineCacheUUID = %u\n", i, physicalDeviceProperties.pipelineCacheUUID);
 
+        gpu_info.bug_local_size_spec_const = false;
+        gpu_info.bug_implicit_fp16_arithmetic = false;
+
         if (physicalDeviceProperties.vendorID == 0x13b5 && physicalDeviceProperties.apiVersion < VK_MAKE_VERSION(1, 0, 66))
         {
-            // ignore arm mali with old buggy driver
-            fprintf(stderr, "arm mali driver is too old\n");
-            continue;
+            // arm mali with old buggy driver
+            gpu_info.bug_local_size_spec_const = true;
         }
 
         if (physicalDeviceProperties.vendorID == 0x5143 && physicalDeviceProperties.apiVersion < VK_MAKE_VERSION(1, 0, 49))
         {
-            // ignore qcom adreno with old buggy driver
-            fprintf(stderr, "qcom adreno driver is too old\n");
-            continue;
+            // qcom adreno with old buggy driver
+            gpu_info.bug_local_size_spec_const = true;
+        }
+
+        if (physicalDeviceProperties.vendorID == 0x13b5 && (physicalDeviceProperties.deviceID == 0x7500001 || physicalDeviceProperties.deviceID == 0x8602000))
+        {
+            // TODO enable devices other than rk3288/rk3399
+            // arm mali driver accept spirv with fp16 arithmetic
+            gpu_info.bug_implicit_fp16_arithmetic = true;
+        }
+
+        if (physicalDeviceProperties.vendorID == 0x5143 && (physicalDeviceProperties.deviceID == 0x6030001 || physicalDeviceProperties.deviceID == 0x6040001))
+        {
+            // TODO enable devices other than qcom855/qcom855plus
+            // qcom adreno driver accept spirv with fp16 arithmetic
+            gpu_info.bug_implicit_fp16_arithmetic = true;
         }
 
         gpu_info.physical_device = physicalDevice;
@@ -569,6 +602,7 @@ int create_gpu_instance()
 
         gpu_info.memory_map_alignment = physicalDeviceProperties.limits.minMemoryMapAlignment;
         gpu_info.buffer_offset_alignment = physicalDeviceProperties.limits.minStorageBufferOffsetAlignment;
+        gpu_info.non_coherent_atom_size = physicalDeviceProperties.limits.nonCoherentAtomSize;
 
         gpu_info.timestamp_period = physicalDeviceProperties.limits.timestampPeriod;
 
@@ -593,6 +627,8 @@ int create_gpu_instance()
         gpu_info.compute_queue_count = queueFamilyProperties[gpu_info.compute_queue_family_index].queueCount;
         gpu_info.graphics_queue_count = queueFamilyProperties[gpu_info.graphics_queue_family_index].queueCount;
         gpu_info.transfer_queue_count = queueFamilyProperties[gpu_info.transfer_queue_family_index].queueCount;
+
+        gpu_info.unified_compute_transfer_queue = gpu_info.compute_queue_family_index == gpu_info.transfer_queue_family_index;
 
         // cache memory properties
         vkGetPhysicalDeviceMemoryProperties(physicalDevice, &gpu_info.physicalDeviceMemoryProperties);
@@ -762,9 +798,25 @@ int create_gpu_instance()
             gpu_info.support_fp16_storage = false;
         }
 
-        fprintf(stderr, "[%u %s]  queueC=%u[%u]  queueT=%u[%u]\n", i, physicalDeviceProperties.deviceName,
+        if (physicalDeviceProperties.vendorID == 0x10002 && physicalDeviceProperties.deviceID == 0x70006214 && physicalDeviceProperties.apiVersion == VK_MAKE_VERSION(1, 1, 82))
+        {
+            // the 16bit_storage implementation of vivante gc1700 driver is buggy :[
+            gpu_info.support_fp16_storage = false;
+        }
+
+        if (gpu_info.bug_implicit_fp16_arithmetic)
+        {
+            // force capability on as long as the driver accept spirv with fp16 arithmetic :D
+            gpu_info.support_fp16_arithmetic = true;
+        }
+
+        fprintf(stderr, "[%u %s]  queueC=%u[%u]  queueG=%u[%u]  queueT=%u[%u]\n", i, physicalDeviceProperties.deviceName,
                 gpu_info.compute_queue_family_index, gpu_info.compute_queue_count,
+                gpu_info.graphics_queue_family_index, gpu_info.graphics_queue_count,
                 gpu_info.transfer_queue_family_index, gpu_info.transfer_queue_count);
+
+        fprintf(stderr, "[%u %s]  buglssc=%d  bugihfa=%d\n", i, physicalDeviceProperties.deviceName,
+                gpu_info.bug_local_size_spec_const, gpu_info.bug_implicit_fp16_arithmetic);
 
         fprintf(stderr, "[%u %s]  fp16p=%d  fp16s=%d  fp16a=%d  int8s=%d  int8a=%d\n", i, physicalDeviceProperties.deviceName,
                 gpu_info.support_fp16_packed, gpu_info.support_fp16_storage, gpu_info.support_fp16_arithmetic,
@@ -777,6 +829,12 @@ int create_gpu_instance()
 
     // the default gpu device
     g_default_gpu_index = find_default_vulkan_device_index();
+
+    // resolve shader info
+    for (int i=0; i<layer_shader_registry_entry_count; i++)
+    {
+        layer_shader_infos[i] = resolve_shader_info(layer_shader_registry[i].spv_data, layer_shader_registry[i].spv_data_size);
+    }
 
     return 0;
 }
@@ -813,22 +871,6 @@ const GpuInfo& get_gpu_info(int device_index)
 {
     return g_gpu_infos[device_index];
 }
-
-struct layer_shader_registry_entry
-{
-    const char* name;
-    const uint32_t* spv_data;
-    size_t spv_data_size;
-};
-
-#include "layer_shader_spv_data.h"
-
-static const layer_shader_registry_entry layer_shader_registry[] =
-{
-#include "layer_shader_registry.h"
-};
-
-static const int layer_shader_registry_entry_count = sizeof(layer_shader_registry) / sizeof(layer_shader_registry_entry);
 
 VulkanDevice::VulkanDevice(int device_index) : info(g_gpu_infos[device_index])
 {
@@ -1037,16 +1079,29 @@ VulkanDevice::~VulkanDevice()
     vkDestroyDevice(device, 0);
 }
 
-VkShaderModule VulkanDevice::get_shader_module(const char* name) const
+VkShaderModule VulkanDevice::get_shader_module(int shader_type_index) const
 {
-    for (int i=0; i<layer_shader_registry_entry_count; i++)
+    if (shader_type_index < 0 || shader_type_index >= layer_shader_registry_entry_count)
     {
-        if (strcmp(layer_shader_registry[i].name, name) == 0)
-            return shader_modules[i];
+        fprintf(stderr, "no such shader module %d\n", shader_type_index);
+        return 0;
     }
 
-    fprintf(stderr, "no such shader module %s\n", name);
-    return 0;
+    return shader_modules[shader_type_index];
+}
+
+VkShaderModule VulkanDevice::create_shader_module(int shader_type_index, uint32_t local_size_x, uint32_t local_size_y, uint32_t local_size_z) const
+{
+    if (shader_type_index < 0 || shader_type_index >= layer_shader_registry_entry_count)
+    {
+        fprintf(stderr, "no such shader module %d\n", shader_type_index);
+        return 0;
+    }
+
+    const uint32_t* spv_data = layer_shader_registry[shader_type_index].spv_data;
+    size_t spv_data_size = layer_shader_registry[shader_type_index].spv_data_size;
+
+    return compile_shader_module(spv_data, spv_data_size, local_size_x, local_size_y, local_size_z);
 }
 
 VkShaderModule VulkanDevice::compile_shader_module(const uint32_t* spv_data, size_t spv_data_size) const
@@ -1065,6 +1120,116 @@ VkShaderModule VulkanDevice::compile_shader_module(const uint32_t* spv_data, siz
         fprintf(stderr, "vkCreateShaderModule failed %d\n", ret);
         return 0;
     }
+
+    return shader_module;
+}
+
+static void inject_local_size_xyz(const uint32_t* code, size_t size, uint32_t local_size_x, uint32_t local_size_y, uint32_t local_size_z, uint32_t* dstcode, size_t* dstsize)
+{
+    uint32_t local_size_x_id = -1;
+    uint32_t local_size_y_id = -1;
+    uint32_t local_size_z_id = -1;
+    uint32_t gl_WorkGroupSize_id = -1;
+
+    const uint32_t* p = code;
+    uint32_t* dp = dstcode;
+
+    // skip magic version generator bound schema
+    memcpy(dp, p, 5 * sizeof(uint32_t));
+    p += 5;
+    dp += 5;
+
+    // foreach op
+    while ((const unsigned char*)p < (const unsigned char*)code + size)
+    {
+        uint32_t opcode = p[0];
+
+        uint16_t wordcount = opcode >> 16;
+        uint16_t op = opcode & 0xffff;
+
+        if (op == 16) // OpExecutionMode
+        {
+            uint32_t mode = p[2];
+            if (mode == 17) // LocalSize
+            {
+                memcpy(dp, p, wordcount * sizeof(uint32_t));
+
+                // set local_size_xyz
+                dp[3] = local_size_x;
+                dp[4] = local_size_y;
+                dp[5] = local_size_z;
+
+                p += wordcount;
+                dp += wordcount;
+                continue;
+            }
+        }
+        else if (op == 50) // OpSpecConstant
+        {
+            uint32_t id = p[2];
+            if (id == local_size_x_id || id == local_size_y_id || id == local_size_z_id)
+            {
+                p += wordcount;
+                continue;
+            }
+        }
+        else if (op == 51) // OpSpecConstantComposite
+        {
+            uint32_t id = p[2];
+            if (id == gl_WorkGroupSize_id)
+            {
+                if (wordcount == 6 && (p[3] == local_size_x_id || p[4] == local_size_y_id || p[5] == local_size_z_id))
+                {
+                    p += wordcount;
+                    continue;
+                }
+            }
+        }
+        else if (op == 71) // OpDecorate
+        {
+            uint32_t id = p[1];
+            uint32_t decoration = p[2];
+            if (decoration == 1) // SpecId
+            {
+                uint32_t specid = p[3];
+                if (specid == 233) local_size_x_id = id;
+                if (specid == 234) local_size_y_id = id;
+                if (specid == 235) local_size_z_id = id;
+                if (specid == 233 || specid == 234 || specid == 235)
+                {
+                    p += wordcount;
+                    continue;
+                }
+            }
+            else if (decoration == 11) // BuiltIn
+            {
+                uint32_t builtin = p[3];
+                if (builtin == 25) // WorkgroupSize
+                {
+                    gl_WorkGroupSize_id = id;
+                    p += wordcount;
+                    continue;
+                }
+            }
+        }
+
+        memcpy(dp, p, wordcount * sizeof(uint32_t));
+        p += wordcount;
+        dp += wordcount;
+    }
+
+    *dstsize = (unsigned char*)dp - (unsigned char*)dstcode;
+}
+
+VkShaderModule VulkanDevice::compile_shader_module(const uint32_t* spv_data, size_t spv_data_size, uint32_t local_size_x, uint32_t local_size_y, uint32_t local_size_z) const
+{
+    uint32_t* spv_data_modified = (uint32_t*)malloc(spv_data_size);
+    size_t spv_data_size_modified = spv_data_size;
+    inject_local_size_xyz(spv_data, spv_data_size, local_size_x, local_size_y, local_size_z, spv_data_modified, &spv_data_size_modified);
+
+    VkShaderModule shader_module = compile_shader_module(spv_data_modified, spv_data_size_modified);
+
+    free(spv_data_modified);
 
     return shader_module;
 }
@@ -1140,6 +1305,13 @@ bool VulkanDevice::is_mappable(uint32_t memory_type_index) const
     const VkMemoryType& memoryType = info.physicalDeviceMemoryProperties.memoryTypes[memory_type_index];
 
     return memoryType.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+}
+
+bool VulkanDevice::is_coherent(uint32_t memory_type_index) const
+{
+    const VkMemoryType& memoryType = info.physicalDeviceMemoryProperties.memoryTypes[memory_type_index];
+
+    return memoryType.propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 }
 
 VkQueue VulkanDevice::acquire_queue(uint32_t queue_family_index) const
@@ -1273,6 +1445,15 @@ static inline bool string_ends_with_fp16p(const char* name)
     return memcmp(name + len - 6, "_fp16p", 6) == 0;
 }
 
+static inline bool string_ends_with_fp16pa(const char* name)
+{
+    int len = strlen(name);
+    if (len < 7)
+        return false;
+
+    return memcmp(name + len - 7, "_fp16pa", 7) == 0;
+}
+
 static inline bool string_ends_with_fp16s(const char* name)
 {
     int len = strlen(name);
@@ -1282,51 +1463,71 @@ static inline bool string_ends_with_fp16s(const char* name)
     return memcmp(name + len - 6, "_fp16s", 6) == 0;
 }
 
-static inline bool string_ends_with_fp16a(const char* name)
+static inline bool string_ends_with_fp16sa(const char* name)
 {
     int len = strlen(name);
-    if (len < 6)
+    if (len < 7)
         return false;
 
-    return memcmp(name + len - 6, "_fp16a", 6) == 0;
+    return memcmp(name + len - 7, "_fp16sa", 7) == 0;
 }
 
 int VulkanDevice::create_shader_module()
 {
+    if (info.bug_local_size_spec_const)
+    {
+        // do not cache shader module
+        return 0;
+    }
+
     shader_modules.resize(layer_shader_registry_entry_count, VK_NULL_HANDLE);
 
     for (int i=0; i<layer_shader_registry_entry_count; i++)
     {
-        const char* shader_name = layer_shader_registry[i].name;
+        // ncnn_add_shader cmake macro
+        // 0 = fp32
+        // 1 = fp16p
+        // 2 = fp16pa
+        // 3 = fp16s
+        // 4 = fp16sa
 
         if (!info.support_fp16_packed)
         {
-            if (string_ends_with_fp16p(shader_name))
+            if (i % 5 == 1)
+                continue;
+        }
+
+        if (!info.support_fp16_packed || !info.support_fp16_arithmetic)
+        {
+            if (i % 5 == 2)
                 continue;
         }
 
         if (!info.support_fp16_storage)
         {
-            if (string_ends_with_fp16s(shader_name))
+            if (i % 5 == 3)
                 continue;
         }
 
-        if (!info.support_fp16_arithmetic)
+        if (!info.support_fp16_storage || !info.support_fp16_arithmetic)
         {
-            if (string_ends_with_fp16a(shader_name))
+            if (i % 5 == 4)
                 continue;
         }
 
-        VkShaderModule shader_module = compile_shader_module(layer_shader_registry[i].spv_data, layer_shader_registry[i].spv_data_size);
+        const uint32_t* spv_data = layer_shader_registry[i].spv_data;
+        size_t spv_data_size = layer_shader_registry[i].spv_data_size;
+
+        VkShaderModule shader_module = compile_shader_module(spv_data, spv_data_size);
         if (shader_module == 0)
         {
-            fprintf(stderr, "compile_shader_module %s failed\n", shader_name);
+            fprintf(stderr, "compile_shader_module %d failed\n", i);
             return -1;
         }
 
         shader_modules[i] = shader_module;
 
-//         fprintf(stderr, "shader_module %s created\n", shader_name);
+//         fprintf(stderr, "shader_module %d created\n", i);
     }
 
     return 0;
@@ -1416,6 +1617,79 @@ VulkanDevice* get_gpu_device(int device_index)
         g_default_vkdev[device_index] = new VulkanDevice(device_index);
 
     return g_default_vkdev[device_index];
+}
+
+const ShaderInfo& get_shader_info(int shader_type_index)
+{
+    if (shader_type_index < 0 || shader_type_index >= layer_shader_registry_entry_count)
+    {
+        fprintf(stderr, "no such shader module %d\n", shader_type_index);
+        return layer_shader_infos[0];
+    }
+
+    return layer_shader_infos[shader_type_index];
+}
+
+ShaderInfo resolve_shader_info(const uint32_t* spv_data, size_t spv_data_size)
+{
+    uint32_t parameter_id = -233;
+
+    int specialization_count = 0;
+    int binding_count = 0;
+    int push_constant_count = 0;
+
+    const uint32_t* p = spv_data;
+
+    // skip magic version generator bound schema
+    p += 5;
+
+    // foreach op
+    while ((const unsigned char*)p < (const unsigned char*)spv_data + spv_data_size)
+    {
+        uint32_t opcode = p[0];
+
+        uint16_t wordcount = opcode >> 16;
+        uint16_t op = opcode & 0xffff;
+
+        if (op == 5) // OpName
+        {
+            uint32_t id = p[1];
+            const char* name = (const char*)&p[2];
+            if (strcmp(name, "parameter") == 0)
+            {
+                parameter_id = id;
+            }
+        }
+        else if (op == 6) // OpMemberName
+        {
+            uint32_t id = p[1];
+            if (id == parameter_id)
+            {
+                push_constant_count++;
+            }
+        }
+        else if (op == 71) // OpDecorate
+        {
+            uint32_t decoration = p[2];
+            if (decoration == 1) // SpecId
+            {
+                specialization_count++;
+            }
+            else if (decoration == 33) // Binding
+            {
+                binding_count++;
+            }
+        }
+
+        p += wordcount;
+    }
+
+    ShaderInfo si;
+    si.specialization_count = specialization_count;
+    si.binding_count = binding_count;
+    si.push_constant_count = push_constant_count;
+
+    return si;
 }
 
 } // namespace ncnn

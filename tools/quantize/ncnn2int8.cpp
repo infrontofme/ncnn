@@ -12,16 +12,14 @@
 // CONDITIONS OF ANY KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations under the License.
 
-#include <stdio.h>
-#include <string.h>
-#include <limits.h>
-#include <math.h>
-#include <assert.h>
+#ifdef _MSC_VER
+#define _CRT_SECURE_NO_DEPRECATE
+#endif
 
-#include <fstream>
+#include <cstdio>
+#include <cstring>
 #include <vector>
 #include <set>
-#include <limits>
 #include <map>
 #include <algorithm>
 #include <layer/yolov3detection.h>
@@ -57,11 +55,13 @@
 #include "layer/interp.h"
 #include "layer/log.h"
 #include "layer/lrn.h"
+#include "layer/lstm.h"
 #include "layer/memorydata.h"
 #include "layer/mvn.h"
 #include "layer/normalize.h"
 #include "layer/padding.h"
 #include "layer/permute.h"
+#include "layer/pixelshuffle.h"
 #include "layer/pooling.h"
 #include "layer/power.h"
 #include "layer/prelu.h"
@@ -94,57 +94,57 @@ static bool read_int8scale_table(const char* filepath, std::map<std::string, std
     FILE* fp = fopen(filepath, "rb");
     if (!fp)
     {
-        fprintf(stderr, "fopen %s failed\n", filepath);
+        fprintf(stderr, "Open %s failed.\n", filepath);
         return false;
     }
 
-    bool in_scale_vector = false;
-
-    std::string keystr;
+    std::string key_str;
     std::vector<float> scales;
 
-    char *line = NULL;
+    std::vector<char>line(102400);
     char *pch = NULL;
     size_t len = 0;
-    ssize_t read;
 
-    while ((read = getline(&line, &len, fp)) != -1)
+    while (NULL != std::fgets(line.data(), static_cast<int>(line.size()), fp))
     {
-
         float scale = 1.f;
         char key[256];
-        line[strcspn(line, "\r\n")] = 0;
-        pch = strtok (line, " ");
+        line[strcspn(line.data(), "\r\n")] = 0;
+
+        pch = strtok(line.data(), " ");
+
         if (pch == NULL) break;
 
-        bool iskey = 1;
+        bool is_key = true;
         while (pch != NULL)
         {
-            if (iskey)
+            if (is_key)
             {
                 sscanf(pch, "%255s", key);
-                keystr = key;
-                iskey = 0;
+
+                key_str = key;
+                is_key = false;
             }
             else
             {
                 sscanf(pch, "%f", &scale);
+
                 scales.push_back(scale);
             }
 
-            pch = strtok (NULL, " ");
+            pch = strtok(NULL, " ");
         }
 
         // XYZ_param_N pattern
-        if (strstr(keystr.c_str(), "_param_"))
+        if (strstr(key_str.c_str(), "_param_"))
         {
-            weight_int8scale_table[ keystr ] = scales;
+            weight_int8scale_table[key_str] = scales;
         }
         else
         {
-            blob_int8scale_table[ keystr ] = scales;
+            blob_int8scale_table[key_str] = scales;
         }
-        keystr.clear();
+        key_str.clear();
         scales.clear();
     }
 
@@ -159,7 +159,7 @@ public:
     // 0=fp32 1=fp16 2=int8
     int storage_type;
     std::map<std::string, std::vector<float> > blob_int8scale_table;
-    std::map<std::string, std::vector<float> > weight_int8scale_table; 
+    std::map<std::string, std::vector<float> > weight_int8scale_table;
 
 public:
     int quantize_convolution();
@@ -178,8 +178,8 @@ public:
 
 int NetQuantize::quantize_convolution()
 {
-    const int layer_count = layers.size();
-    for (int i=0; i<layer_count; i++)
+    const int layer_count = static_cast<int>(layers.size());
+    for (int i = 0; i < layer_count; i++)
     {
         // find convoultion layer
         if (layers[i]->type != "Convolution")
@@ -192,13 +192,14 @@ int NetQuantize::quantize_convolution()
 
         char key[256];
         sprintf(key, "%s_param_0", layers[i]->name.c_str());
+
         std::map<std::string, std::vector<float> >::iterator iter = weight_int8scale_table.find(key);
         if (iter == weight_int8scale_table.end())
         {
             fprintf(stderr, "this layer need to be quantized, but no scale param!\n");
             return -1;
         }
-            
+
         // Convolution - quantize weight from fp32 to int8
         ncnn::Convolution* convolution = (ncnn::Convolution*)layers[i];
 
@@ -214,7 +215,7 @@ int NetQuantize::quantize_convolution()
             const int weight_data_size_output = convolution->weight_data_size / convolution->num_output;
 
             // quantize weight to int8
-            for (int n=0; n<convolution->num_output; n++)
+            for (int n = 0; n < convolution->num_output; n++)
             {
                 ncnn::Layer* op = ncnn::create_layer(ncnn::LayerType::Quantize);
 
@@ -244,8 +245,8 @@ int NetQuantize::quantize_convolution()
 
 int NetQuantize::quantize_convolutiondepthwise()
 {
-    const int layer_count = layers.size();
-    for (int i=0; i<layer_count; i++)
+    const int layer_count = static_cast<int>(layers.size());
+    for (int i = 0; i < layer_count; i++)
     {
         // find convoultion layer
         if (layers[i]->type != "ConvolutionDepthWise")
@@ -258,13 +259,14 @@ int NetQuantize::quantize_convolutiondepthwise()
 
         char key[256];
         sprintf(key, "%s_param_0", layers[i]->name.c_str());
+
         std::map<std::string, std::vector<float> >::iterator iter = weight_int8scale_table.find(key);
         if (iter == weight_int8scale_table.end())
         {
             fprintf(stderr, "this layer need to be quantized, but no scale param!\n");
             return -1;
         }
-            
+
         // Convolution - quantize weight from fp32 to int8
         ncnn::ConvolutionDepthWise* convdw = (ncnn::ConvolutionDepthWise*)layers[i];
 
@@ -280,7 +282,7 @@ int NetQuantize::quantize_convolutiondepthwise()
             const int weight_data_size_output = convdw->weight_data_size / convdw->group;
 
             // quantize weight to int8
-            for (int n=0; n<convdw->group; n++)
+            for (int n = 0; n < convdw->group; n++)
             {
                 ncnn::Layer* op = ncnn::create_layer(ncnn::LayerType::Quantize);
 
@@ -310,8 +312,8 @@ int NetQuantize::quantize_convolutiondepthwise()
 
 int NetQuantize::quantize_innerproduct()
 {
-    const int layer_count = layers.size();
-    for (int i=0; i<layer_count; i++)
+    const int layer_count = static_cast<int>(layers.size());
+    for (int i = 0; i < layer_count; i++)
     {
         // find convoultion layer
         if (layers[i]->type != "InnerProduct")
@@ -324,13 +326,14 @@ int NetQuantize::quantize_innerproduct()
 
         char key[256];
         sprintf(key, "%s_param_0", layers[i]->name.c_str());
+
         std::map<std::string, std::vector<float> >::iterator iter = weight_int8scale_table.find(key);
         if (iter == weight_int8scale_table.end())
         {
             fprintf(stderr, "this layer need to be quantized, but no scale param!\n");
             return -1;
         }
-            
+
         // InnerProduct - quantize weight from fp32 to int8
         ncnn::InnerProduct* fc = (ncnn::InnerProduct*)layers[i];
 
@@ -346,7 +349,7 @@ int NetQuantize::quantize_innerproduct()
             const int weight_data_size_output = fc->weight_data_size / fc->num_output;
 
             // quantize weight to int8
-            for (int n=0; n<fc->num_output; n++)
+            for (int n = 0; n < fc->num_output; n++)
             {
                 ncnn::Layer* op = ncnn::create_layer(ncnn::LayerType::Quantize);
 
@@ -380,7 +383,7 @@ int NetQuantize::fprintf_param_int_array(int id, const ncnn::Mat& m, FILE* pp)
     const int* ptr = m;
 
     fprintf(pp, " -%d=%d", 23300 + id, count);
-    for (int i=0; i<count; i++)
+    for (int i = 0; i < count; i++)
     {
         fprintf(pp, ",%d", ptr[i]);
     }
@@ -394,7 +397,7 @@ int NetQuantize::fprintf_param_float_array(int id, const ncnn::Mat& m, FILE* pp)
     const float* ptr = m;
 
     fprintf(pp, " -%d=%d", 23300 + id, count);
-    for (int i=0; i<count; i++)
+    for (int i = 0; i < count; i++)
     {
         fprintf(pp, ",%f", ptr[i]);
     }
@@ -404,7 +407,7 @@ int NetQuantize::fprintf_param_float_array(int id, const ncnn::Mat& m, FILE* pp)
 
 static inline size_t alignSize(size_t sz, int n)
 {
-    return (sz + n-1) & -n;
+    return (sz + n - 1) & -n;
 }
 
 int NetQuantize::fwrite_weight_tag_data(int tag, const ncnn::Mat& data, FILE* bp)
@@ -421,8 +424,8 @@ int NetQuantize::fwrite_weight_tag_data(int tag, const ncnn::Mat& data, FILE* bp
 
     // padding to 32bit align
     int nwrite = ftell(bp) - p0;
-    int nalign = alignSize(nwrite, 4);
-    unsigned char padding[4] = {0x00, 0x00, 0x00, 0x00};
+    int nalign = static_cast<int>(alignSize(nwrite, 4));
+    unsigned char padding[4] = { 0x00, 0x00, 0x00, 0x00 };
     fwrite(padding, sizeof(unsigned char), nalign - nwrite, bp);
 
     return 0;
@@ -437,8 +440,8 @@ int NetQuantize::fwrite_weight_data(const ncnn::Mat& data, FILE* bp)
 
     // padding to 32bit align
     int nwrite = ftell(bp) - p0;
-    int nalign = alignSize(nwrite, 4);
-    unsigned char padding[4] = {0x00, 0x00, 0x00, 0x00};
+    int nalign = static_cast<int>(alignSize(nwrite, 4));
+    unsigned char padding[4] = { 0x00, 0x00, 0x00, 0x00 };
     fwrite(padding, sizeof(unsigned char), nalign - nwrite, bp);
 
     return 0;
@@ -451,11 +454,11 @@ int NetQuantize::save(const char* parampath, const char* binpath)
 
     fprintf(pp, "7767517\n");
 
-    const int layer_count = layers.size();
+    const int layer_count = static_cast<int>(layers.size());
 
     int layer_count_fused = 0;
     std::set<std::string> blob_names;
-    for (int i=0; i<layer_count; i++)
+    for (int i = 0; i < layer_count; i++)
     {
         const ncnn::Layer* layer = layers[i];
         if (layer->type == "ncnnfused")
@@ -463,42 +466,42 @@ int NetQuantize::save(const char* parampath, const char* binpath)
 
         layer_count_fused++;
 
-        int bottom_count = layer->bottoms.size();
-        for (int j=0; j<bottom_count; j++)
+        int bottom_count = static_cast<int>(layer->bottoms.size());
+        for (int j = 0; j < bottom_count; j++)
         {
             int bottom_blob_index = layer->bottoms[j];
             blob_names.insert(blobs[bottom_blob_index].name);
         }
 
-        int top_count = layer->tops.size();
-        for (int j=0; j<top_count; j++)
+        int top_count = static_cast<int>(layer->tops.size());
+        for (int j = 0; j < top_count; j++)
         {
             int top_blob_index = layer->tops[j];
             blob_names.insert(blobs[top_blob_index].name);
         }
     }
 
-    int blob_count_fused = blob_names.size();
+    int blob_count_fused = static_cast<int>(blob_names.size());
 
     fprintf(pp, "%d %d\n", layer_count_fused, blob_count_fused);
 
-    for (int i=0; i<layer_count; i++)
+    for (int i = 0; i < layer_count; i++)
     {
         const ncnn::Layer* layer = layers[i];
         if (layer->type == "ncnnfused")
             continue;
 
-        int bottom_count = layer->bottoms.size();
-        int top_count = layer->tops.size();
+        int bottom_count = static_cast<int>(layer->bottoms.size());
+        int top_count = static_cast<int>(layer->tops.size());
 
         fprintf(pp, "%-24s %-24s %d %d", layer->type.c_str(), layer->name.c_str(), bottom_count, top_count);
 
-        for (int j=0; j<bottom_count; j++)
+        for (int j = 0; j < bottom_count; j++)
         {
             int bottom_blob_index = layer->bottoms[j];
             fprintf(pp, " %s", blobs[bottom_blob_index].name.c_str());
         }
-        for (int j=0; j<top_count; j++)
+        for (int j = 0; j < top_count; j++)
         {
             int top_blob_index = layer->tops[j];
             fprintf(pp, " %s", blobs[top_blob_index].name.c_str());
@@ -585,12 +588,13 @@ int NetQuantize::save(const char* parampath, const char* binpath)
 
             // write int8_scale data
             if (op->int8_scale_term)
-            {            
+            {
                 std::vector<float> weight_int8scale;
                 std::vector<float> blob_int8scale;
 
                 char key[256];
-                sprintf(key, "%s_param_0", layer->name.c_str());
+                sprintf(key, "%s_param_0", layers[i]->name.c_str());
+
                 if (weight_int8scale_table.find(std::string(key)) != weight_int8scale_table.end())
                 {
                     weight_int8scale = weight_int8scale_table[std::string(key)];
@@ -634,12 +638,13 @@ int NetQuantize::save(const char* parampath, const char* binpath)
 
             // write int8_scale data
             if (op->int8_scale_term)
-            {            
+            {
                 std::vector<float> weight_int8scale;
                 std::vector<float> blob_int8scale;
 
                 char key[256];
-                sprintf(key, "%s_param_0", layer->name.c_str());
+                sprintf(key, "%s_param_0", layers[i]->name.c_str());
+
                 if (weight_int8scale_table.find(std::string(key)) != weight_int8scale_table.end())
                 {
                     weight_int8scale = weight_int8scale_table[std::string(key)];
@@ -653,7 +658,7 @@ int NetQuantize::save(const char* parampath, const char* binpath)
                 // write int8_scale data
                 fwrite(weight_int8scale.data(), sizeof(float), weight_int8scale.size(), bp);
                 fwrite(blob_int8scale.data(), sizeof(float), blob_int8scale.size(), bp);
-            }            
+            }
         }
         else if (layer->type == "Crop")
         {
@@ -785,12 +790,13 @@ int NetQuantize::save(const char* parampath, const char* binpath)
 
             // write int8_scale data
             if (op->int8_scale_term)
-            {            
+            {
                 std::vector<float> weight_int8scale;
                 std::vector<float> blob_int8scale;
 
                 char key[256];
-                sprintf(key, "%s_param_0", layer->name.c_str());
+                sprintf(key, "%s_param_0", layers[i]->name.c_str());
+
                 if (weight_int8scale_table.find(std::string(key)) != weight_int8scale_table.end())
                 {
                     weight_int8scale = weight_int8scale_table[std::string(key)];
@@ -804,7 +810,7 @@ int NetQuantize::save(const char* parampath, const char* binpath)
                 // write int8_scale data
                 fwrite(weight_int8scale.data(), sizeof(float), weight_int8scale.size(), bp);
                 fwrite(blob_int8scale.data(), sizeof(float), blob_int8scale.size(), bp);
-            }            
+            }
         }
         else if (layer->type == "Input")
         {
@@ -854,6 +860,19 @@ int NetQuantize::save(const char* parampath, const char* binpath)
             fprintf_param_value(" 3=%f", beta)
             fprintf_param_value(" 4=%f", bias)
         }
+        else if (layer->type == "LSTM")
+        {
+            ncnn::LSTM* op = (ncnn::LSTM*)layer;
+            ncnn::LSTM* op_default = (ncnn::LSTM*)layer_default;
+
+            fprintf_param_value(" 0=%d", num_output)
+            fprintf_param_value(" 1=%d", weight_data_size)
+            fprintf_param_value(" 2=%d", direction)
+
+            fwrite_weight_tag_data(0, op->weight_xc_data, bp);
+            fwrite_weight_tag_data(0, op->bias_c_data, bp);
+            fwrite_weight_tag_data(0, op->weight_hc_data, bp);
+        }
         else if (layer->type == "MemoryData")
         {
             ncnn::MemoryData* op = (ncnn::MemoryData*)layer;
@@ -884,7 +903,7 @@ int NetQuantize::save(const char* parampath, const char* binpath)
             fprintf_param_value(" 3=%d", scale_data_size)
             fprintf_param_value(" 4=%d", across_channel)
 
-            fwrite_weight_data(op->scale_data, bp);
+                fwrite_weight_data(op->scale_data, bp);
         }
         else if (layer->type == "Padding")
         {
@@ -904,6 +923,13 @@ int NetQuantize::save(const char* parampath, const char* binpath)
             ncnn::Permute* op_default = (ncnn::Permute*)layer_default;
 
             fprintf_param_value(" 0=%d", order_type)
+        }
+        else if (layer->type == "PixelShuffle")
+        {
+            ncnn::PixelShuffle* op = (ncnn::PixelShuffle*)layer;
+            ncnn::PixelShuffle* op_default = (ncnn::PixelShuffle*)layer_default;
+
+            fprintf_param_value(" 0=%d", upscale_factor)
         }
         else if (layer->type == "Pooling")
         {
@@ -1211,7 +1237,7 @@ int main(int argc, char** argv)
 
     quantizer.load_param(inparam);
     quantizer.load_model(inbin);
-    
+
     quantizer.quantize_convolution();
     quantizer.quantize_convolutiondepthwise();
     quantizer.quantize_innerproduct();
